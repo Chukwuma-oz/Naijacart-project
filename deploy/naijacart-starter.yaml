@@ -1,0 +1,92 @@
+# CloudFormation STARTER (Session 28) — deliberately incomplete.
+# It gives teams the networking skeleton (VPC, 2 public + 2 private subnets,
+# IGW, routes) and a tagged S3 frontend bucket. Teams add: ALB, Launch
+# Template + ASG (using deploy/userdata.sh), RDS MySQL in the private
+# subnets, security groups, Secrets Manager secret, and CloudFront.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: NaijaCart capstone starter - VPC skeleton + frontend bucket
+
+Parameters:
+  ProjectTag:
+    Type: String
+    Default: naijacart
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Tier, Value: public }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Tier, Value: public }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Tier, Value: private }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Tier, Value: private }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PubARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PubBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Keep the bucket PRIVATE; serve it via CloudFront with OAC (Session 18).
+
+Outputs:
+  VpcId:            { Value: !Ref VPC }
+  PublicSubnets:    { Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]] }
+  PrivateSubnets:   { Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]] }
+  FrontendBucket:   { Value: !Ref FrontendBucket }

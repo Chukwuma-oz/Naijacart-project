@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NaijaCart — Marketplace</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Naija<span>Cart</span></div>
+  <div class="top-actions">
+    <span id="who" class="who"></span>
+    <button id="btn-orders" class="ghost hidden">My Orders</button>
+    <button id="btn-auth" class="ghost">Sign in</button>
+    <button id="btn-cart" class="primary">Cart (<span id="cart-count">0</span>)</button>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>Made in Naija. Delivered anywhere.</h1>
+    <p>A demo storefront for the AWS Cloud Computing Course capstone.</p>
+  </section>
+  <section id="grid" class="grid" aria-live="polite"></section>
+</main>
+
+<!-- Cart drawer -->
+<aside id="cart" class="drawer hidden">
+  <div class="drawer-head"><h2>Your Cart</h2><button id="cart-close" class="ghost">Close</button></div>
+  <div id="cart-items"></div>
+  <div class="cart-total">Total: <strong id="cart-total">NGN 0</strong></div>
+  <button id="btn-checkout" class="primary wide">Checkout</button>
+  <p id="cart-msg" class="msg"></p>
+</aside>
+
+<!-- Auth modal -->
+<div id="auth" class="modal hidden">
+  <div class="modal-card">
+    <h2 id="auth-title">Sign in</h2>
+    <input id="auth-name" placeholder="Name (register only)" class="hidden">
+    <input id="auth-email" type="email" placeholder="Email">
+    <input id="auth-pass" type="password" placeholder="Password">
+    <button id="auth-submit" class="primary wide">Sign in</button>
+    <p class="switch">
+      <a id="auth-switch" href="#">Need an account? Register</a>
+      &nbsp;|&nbsp; <a id="auth-close" href="#">Cancel</a>
+    </p>
+    <p id="auth-msg" class="msg"></p>
+  </div>
+</div>
+
+<!-- Orders modal -->
+<div id="orders" class="modal hidden">
+  <div class="modal-card">
+    <h2>My Orders</h2>
+    <div id="orders-list"></div>
+    <p class="switch"><a id="orders-close" href="#">Close</a></p>
+  </div>
+</div>
+
+<footer>NaijaCart demo &middot; AWS Cloud Computing Course capstone &middot; frontend served from S3 + CloudFront, API on ALB, data on RDS MySQL</footer>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

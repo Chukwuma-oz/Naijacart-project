@@ -1,0 +1,440 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  NaijaCart production launch stack (Capstone Deliverable 3).
+  Provisions: VPC (2 AZ, public+private), NAT, security groups, Secrets Manager
+  DB secret, RDS MySQL (encrypted), ElastiCache Redis, IAM instance role,
+  ALB + Launch Template + Auto Scaling group, private S3 frontend bucket +
+  CloudFront (OAC), and a CloudWatch alarm.
+  PREREQUISITE: an artifact S3 bucket containing naijacart-backend.zip
+  (the GitHub Actions workflow in .github/workflows/deploy.yml uploads it).
+
+Parameters:
+  ProjectTag:
+    Type: String
+    Default: naijacart
+  ArtifactBucket:
+    Type: String
+    Description: Existing S3 bucket holding the backend artifact zip
+  ArtifactKey:
+    Type: String
+    Default: naijacart-backend.zip
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DbMultiAZ:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: true for the board's launch config (HA); false to minimise lab cost
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  IsMultiAZ: !Equals [!Ref DbMultiAZ, "true"]
+
+Resources:
+
+  # ---------------- 1. NETWORKING (Deliverable 1 territory) ----------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-vpc }]
+
+  InternetGateway: { Type: AWS::EC2::InternetGateway }
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-public-a }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-public-b }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-private-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-private-b }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC, Tags: [{ Key: Name, Value: naijacart-public-rt }] }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PubAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PubBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC, Tags: [{ Key: Name, Value: naijacart-private-rt }] }
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  PrivBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+
+  # ---------------- 2. SECURITY GROUPS (the SG chain) ----------------
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tier - 8080 from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSG }
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL - 3306 from app tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSG }
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+  CacheSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis - 6379 from app tier only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSG }
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  # ---------------- 3. SECRETS & DATA LAYER ----------------
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-db"
+      Description: NaijaCart MySQL credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "naijacart_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: "\"@/\\'"
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: NaijaCart private DB subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql   # engine version omitted -> RDS default (MySQL 8.x)
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      DBName: naijacart
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSG]
+      MultiAZ: !If [IsMultiAZ, true, false]
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  # Writes host/port/dbname back into the secret so db.js gets everything it needs
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: NaijaCart Redis private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  RedisCache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      VpcSecurityGroupIds: [!Ref CacheSG]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  # ---------------- 4. IAM (least privilege) ----------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # Session Manager, no SSH
+      Policies:
+        - PolicyName: naijacart-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDbSecretOnly
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
+              - Sid: PullBackendArtifact
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${ArtifactKey}"
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------- 5. COMPUTE: ALB + ASG ----------------
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSG]
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: DbSecretAttachment
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSG]
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Project, Value: !Ref ProjectTag }, { Key: Name, Value: naijacart-app }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -eux
+            dnf install -y nodejs unzip
+            mkdir -p /opt/naijacart
+            aws s3 cp s3://${ArtifactBucket}/${ArtifactKey} /tmp/app.zip
+            unzip -o /tmp/app.zip -d /opt/naijacart
+            cd /opt/naijacart
+            if [ ! -d node_modules ]; then npm install --omit=dev; fi
+            cat > /etc/systemd/system/naijacart.service << 'UNIT'
+            [Unit]
+            Description=NaijaCart API
+            After=network.target
+            [Service]
+            WorkingDirectory=/opt/naijacart
+            EnvironmentFile=/opt/naijacart/aws.env
+            ExecStart=/usr/bin/node server.js
+            Restart=always
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            cat > /opt/naijacart/aws.env << ENVEOF
+            PORT=8080
+            NODE_ENV=production
+            DB_SECRET_ARN=${DbSecret}
+            REDIS_URL=redis://${RedisCache.RedisEndpoint.Address}:${RedisCache.RedisEndpoint.Port}
+            ENVEOF
+            systemctl daemon-reload
+            systemctl enable --now naijacart
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      DesiredCapacity: "2"
+      MaxSize: "4"
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      Tags:
+        - { Key: Project, Value: !Ref ProjectTag, PropagateAtLaunch: true }
+
+  # ---------------- 6. FRONTEND: S3 + CloudFront (OAC) ----------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: s3-frontend
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # CachingOptimized (managed)
+        Comment: NaijaCart frontend
+      Tags: [{ Key: Project, Value: !Ref ProjectTag }]
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ---------------- 7. OBSERVABILITY ----------------
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: NaijaCart - unhealthy targets behind the ALB
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+
+Outputs:
+  ApiUrl:
+    Description: Put this (with http://) into frontend/config.js API_BASE
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  CloudFrontDomain:
+    Description: The storefront URL - also the value for the backend CORS_ORIGIN
+    Value: !Sub "https://${Distribution.DomainName}"
+  FrontendBucketName:
+    Description: Upload frontend/ here (GitHub Actions does this)
+    Value: !Ref FrontendBucket
+  AutoScalingGroupName:
+    Description: For GitHub Actions instance refresh
+    Value: !Ref AutoScalingGroup
+  DbSecretArn:
+    Value: !Ref DbSecret
+  RedisEndpoint:
+    Value: !Sub "${RedisCache.RedisEndpoint.Address}:${RedisCache.RedisEndpoint.Port}"

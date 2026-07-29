@@ -1,0 +1,42 @@
+{
+  "_comment": "Least-privilege IAM policy EXAMPLES for the capstone (Sessions 6-7, 26). Attach Policy A to the EC2 instance role / ECS task role. Replace placeholders. These are teaching examples - review before real use.",
+
+  "PolicyA_AppRuntimeRole": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ReadDbSecretOnly",
+        "Effect": "Allow",
+        "Action": "secretsmanager:GetSecretValue",
+        "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:naijacart-db-*"
+      },
+      {
+        "Sid": "PullBackendArtifact",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::YOUR-ARTIFACT-BUCKET/naijacart-backend.zip"
+      }
+    ]
+  },
+
+  "PolicyB_FrontendDeployUser_or_PipelineRole": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "SyncFrontendToBucket",
+        "Effect": "Allow",
+        "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+        "Resource": [
+          "arn:aws:s3:::YOUR-FRONTEND-BUCKET",
+          "arn:aws:s3:::YOUR-FRONTEND-BUCKET/*"
+        ]
+      },
+      {
+        "Sid": "InvalidateCloudFront",
+        "Effect": "Allow",
+        "Action": "cloudfront:CreateInvalidation",
+        "Resource": "arn:aws:cloudfront::ACCOUNT_ID:distribution/DISTRIBUTION_ID"
+      }
+    ]
+  }
+}

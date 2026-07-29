@@ -1,0 +1,57 @@
+{
+  "_comment": "OIDC deploy role for GitHub Actions (Deliverable 4). Two documents: the TRUST policy (who may assume the role - only your repo's main branch) and the PERMISSIONS policy (what it may do - least privilege). Replace ACCOUNT_ID, YOUR_GITHUB_ORG/naijacart, buckets, region and distribution id.",
+
+  "TrustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+        },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          },
+          "StringLike": {
+            "token.actions.githubusercontent.com:sub": "repo:YOUR_GITHUB_ORG/naijacart:ref:refs/heads/main"
+          }
+        }
+      }
+    ]
+  },
+
+  "PermissionsPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "UploadBackendArtifact",
+        "Effect": "Allow",
+        "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::YOUR-ARTIFACT-BUCKET/naijacart-backend.zip"
+      },
+      {
+        "Sid": "SyncFrontend",
+        "Effect": "Allow",
+        "Action": ["s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+        "Resource": [
+          "arn:aws:s3:::YOUR-FRONTEND-BUCKET",
+          "arn:aws:s3:::YOUR-FRONTEND-BUCKET/*"
+        ]
+      },
+      {
+        "Sid": "InvalidateCloudFront",
+        "Effect": "Allow",
+        "Action": "cloudfront:CreateInvalidation",
+        "Resource": "arn:aws:cloudfront::ACCOUNT_ID:distribution/DISTRIBUTION_ID"
+      },
+      {
+        "Sid": "RollTheASG",
+        "Effect": "Allow",
+        "Action": ["autoscaling:StartInstanceRefresh", "autoscaling:DescribeInstanceRefreshes"],
+        "Resource": "*"
+      }
+    ]
+  }
+}

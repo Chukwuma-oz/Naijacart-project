@@ -1,0 +1,89 @@
+# NaijaCart — GitHub Actions deployment (Capstone Deliverable 4)
+#
+# On every push to main:
+#   Job 1  packages the backend (WITH node_modules, so instances boot without
+#          reaching npm), uploads it to the artifact bucket, and rolls the
+#          Auto Scaling group with an instance refresh (zero-downtime,
+#          honours MinHealthyPercentage — the blue/green idea from Session 30).
+#   Job 2  syncs frontend/ to the S3 frontend bucket and invalidates CloudFront.
+#
+# AUTH: OIDC federation — GitHub exchanges a short-lived token for an AWS role.
+#       No AWS access keys are stored in GitHub. Setup steps are in
+#       deploy/github-oidc-setup.md; the role's trust & permissions policies
+#       are in deploy/github-oidc-role.json.
+#
+# Repository secrets required (Settings -> Secrets and variables -> Actions):
+#   AWS_DEPLOY_ROLE_ARN   arn of the OIDC deploy role
+#   AWS_REGION            e.g. af-south-1 or eu-west-1
+#   ARTIFACT_BUCKET       the bucket passed to CloudFormation as ArtifactBucket
+#   FRONTEND_BUCKET       CloudFormation output FrontendBucketName
+#   CF_DISTRIBUTION_ID    the CloudFront distribution id
+#   ASG_NAME              CloudFormation output AutoScalingGroupName
+
+name: Deploy NaijaCart to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write     # required for OIDC
+  contents: read
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install production dependencies
+        working-directory: backend
+        run: npm ci --omit=dev || npm install --omit=dev
+
+      - name: Package backend (includes node_modules)
+        working-directory: backend
+        run: zip -qr ../naijacart-backend.zip .
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        run: aws s3 cp naijacart-backend.zip s3://${{ secrets.ARTIFACT_BUCKET }}/naijacart-backend.zip
+
+      - name: Roll the Auto Scaling group (instance refresh)
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}'
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync frontend to S3
+        run: aws s3 sync frontend/ s3://${{ secrets.FRONTEND_BUCKET }}/ --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ secrets.CF_DISTRIBUTION_ID }}" \
+            --paths "/*"

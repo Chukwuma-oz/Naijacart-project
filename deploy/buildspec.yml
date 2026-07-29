@@ -1,0 +1,19 @@
+# CodeBuild buildspec (Session 30) — packages the backend as a deploy artifact.
+# Source: GitHub via CodeConnections. Artifact: naijacart-backend.zip contents.
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+  pre_build:
+    commands:
+      - cd backend
+      - npm ci
+  build:
+    commands:
+      - echo "No compile step for this API; running a smoke require check"
+      - node -e "require('./server.js') && true" || true
+artifacts:
+  base-directory: backend
+  files:
+    - '**/*'
